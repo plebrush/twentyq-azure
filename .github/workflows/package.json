@@ -1,0 +1,7 @@
+{
+  "name": "twentyq-api",
+  "private": true,
+  "dependencies": {
+    "@azure/data-tables": "^13.2.0"
+  }
+}
