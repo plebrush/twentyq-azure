@@ -1,39 +1,49 @@
 const { TableClient } = require("@azure/data-tables");
 
 module.exports = async function (context, req) {
-  const connectionString = process.env.STORAGE_CONNECTION_STRING;
+  try {
+    const connectionString = process.env.STORAGE_CONNECTION_STRING;
 
-  if (!connectionString) {
+    if (!connectionString) {
+      context.res = {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+        body: { error: "Missing STORAGE_CONNECTION_STRING environment variable" }
+      };
+      return;
+    }
+
+    const tableClient = TableClient.fromConnectionString(
+      connectionString,
+      "Sessions"
+    );
+
+    const sessionId =
+      Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+
+    await tableClient.createEntity({
+      partitionKey: "session",
+      rowKey: sessionId,
+      questionNumber: 0,
+      createdAt: new Date().toISOString()
+    });
+
+    context.res = {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: {
+        sessionId,
+        text: "Think of something. I’ll try to guess it in 20 questions."
+      }
+    };
+  } catch (err) {
     context.res = {
       status: 500,
-      body: { error: "Missing STORAGE_CONNECTION_STRING" }
+      headers: { "Content-Type": "application/json" },
+      body: {
+        error: "Start function failed",
+        details: err && err.message ? err.message : String(err)
+      }
     };
-    return;
   }
-
-  const tableClient = TableClient.fromConnectionString(
-    connectionString,
-    "Sessions"
-  );
-
-  const sessionId =
-    Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
-
-  const entity = {
-    partitionKey: "session",
-    rowKey: sessionId,
-    questionNumber: 0,
-    createdAt: new Date().toISOString()
-  };
-
-  await tableClient.createEntity(entity);
-
-  context.res = {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-    body: {
-      sessionId,
-      text: "Think of something. I’ll try to guess it in 20 questions."
-    }
-  };
 };
