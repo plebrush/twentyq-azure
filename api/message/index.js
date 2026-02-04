@@ -6,6 +6,23 @@ function env(name) {
   return v;
 }
 
+function safeJsonParse(s, fallback) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeQuestion(q) {
+  return (q || "")
+    .toString()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/^[\-\*\d\.\)\s]+/, "")
+    .replace(/^["'“”]+|["'“”]+$/g, "");
+}
+
 async function postJson(url, headers, body) {
   const res = await fetch(url, {
     method: "POST",
@@ -18,42 +35,48 @@ async function postJson(url, headers, body) {
   try {
     json = text ? JSON.parse(text) : null;
   } catch {
-    // leave json null
+    // ignore
   }
 
   return { ok: res.ok, status: res.status, text, json };
 }
 
 /**
- * Calls Azure OpenAI in a robust way.
- * It tries:
- *  1) Classic Azure OpenAI deployments endpoint (api-key header)
- *  2) Foundry v1 endpoint with model=deployment name (api-key header)
- *  3) Foundry v1 endpoint with model=model name (api-key header)
- *  4) Same as (2) but using Authorization: Bearer (some configs expect this)
+ * Robust Azure OpenAI call: tries multiple endpoint styles.
+ * Returns: { question, used }
  */
-async function callAzureOpenAI({ notes, questionNumber, userAnswer }) {
+async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
   const endpoint = env("AZURE_OPENAI_ENDPOINT").replace(/\/+$/, "");
   const apiKey = env("AZURE_OPENAI_KEY");
   const deployment = env("AZURE_OPENAI_DEPLOYMENT");
 
-  // If you deployed gpt-4.1-nano, keep this:
+  // Your deployed model name (from Foundry details)
   const modelName = "gpt-4.1-nano";
+
+  const askedList = (asked || []).slice(-20); // cap so prompt stays small
+  const askedText =
+    askedList.length > 0
+      ? askedList.map((q, i) => `${i + 1}. ${q}`).join("\n")
+      : "(none yet)";
 
   const system = [
     "You are playing 20 Questions.",
     "Ask exactly ONE yes/no question at a time to guess the user's secret object.",
-    "Output MUST be only the question text (no extra words).",
-    "Keep it short. Don't repeat previous questions.",
-    "If confident, ask: 'Is it <your guess>?'",
-    "Max 20 questions."
+    "CRITICAL RULES:",
+    "- Output MUST be only the question text.",
+    "- It must be a YES/NO style question.",
+    "- Do NOT repeat any question from the Previously asked list.",
+    "- Keep it short and specific.",
+    "- If very confident, ask: 'Is it <your guess>?'",
+    "- Max 20 questions total."
   ].join("\n");
 
   const user = [
     `We are on question ${questionNumber}/20.`,
     `User just answered: ${userAnswer || "(none yet)"}`,
-    `Notes so far (compressed memory): ${notes || "(none)"}`,
-    "Ask the next best yes/no question."
+    `Notes (compressed): ${notes || "(none)"}`,
+    `Previously asked (DO NOT REPEAT):\n${askedText}`,
+    "Now ask the best next yes/no question."
   ].join("\n");
 
   const messages = [
@@ -63,7 +86,7 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer }) {
 
   const attempts = [];
 
-  // Attempt 1: classic deployments endpoint
+  // Attempt A: classic Azure OpenAI deployments endpoint
   attempts.push({
     name: "classic-deployments",
     url: `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2024-02-15-preview`,
@@ -71,7 +94,7 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer }) {
     body: { messages, temperature: 0.4, max_tokens: 80 }
   });
 
-  // Attempt 2: v1 endpoint, model = deployment name
+  // Attempt B: v1 endpoint using model=deployment
   attempts.push({
     name: "v1-model=deployment",
     url: `${endpoint}/openai/v1/chat/completions`,
@@ -79,7 +102,7 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer }) {
     body: { model: deployment, messages, temperature: 0.4, max_tokens: 80 }
   });
 
-  // Attempt 3: v1 endpoint, model = model name
+  // Attempt C: v1 endpoint using model=modelName
   attempts.push({
     name: "v1-model=modelName",
     url: `${endpoint}/openai/v1/chat/completions`,
@@ -87,7 +110,7 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer }) {
     body: { model: modelName, messages, temperature: 0.4, max_tokens: 80 }
   });
 
-  // Attempt 4: v1 endpoint, Authorization Bearer (some tenants)
+  // Attempt D: Bearer auth variant
   attempts.push({
     name: "v1-bearer-model=deployment",
     url: `${endpoint}/openai/v1/chat/completions`,
@@ -106,7 +129,8 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer }) {
         r.json?.choices?.[0]?.text?.trim();
 
       if (content) {
-        const q = content.endsWith("?") ? content : `${content}?`;
+        let q = normalizeQuestion(content);
+        if (!q.endsWith("?")) q = `${q}?`;
         return { question: q, used: a.name };
       }
 
@@ -114,24 +138,66 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer }) {
       continue;
     }
 
-    // capture useful error details
     lastError = new Error(
       `OpenAI ${a.name} failed (${r.status}): ${r.text || "(empty response)"}`
     );
-
-    // if it’s clearly auth, don’t bother trying more formats with same header
-    // but we still try the Bearer variant later.
-    continue;
   }
 
   throw lastError || new Error("Azure OpenAI call failed");
+}
+
+/**
+ * Ensure we never repeat a question.
+ * If model repeats, retry a few times. If still repeats, fallback.
+ */
+async function getNonRepeatingQuestion({ notes, questionNumber, userAnswer, asked }) {
+  const askedSet = new Set((asked || []).map((q) => normalizeQuestion(q).toLowerCase()));
+
+  // Try model up to 3 times
+  for (let i = 0; i < 3; i++) {
+    const { question, used } = await callAzureOpenAI({
+      notes,
+      questionNumber,
+      userAnswer,
+      asked
+    });
+
+    const norm = normalizeQuestion(question).toLowerCase();
+    if (!askedSet.has(norm)) {
+      return { question, used };
+    }
+  }
+
+  // Hard fallback bank (guaranteed non-repeat)
+  const fallback = [
+    "Is it an animal?",
+    "Is it a plant?",
+    "Is it something you’d find indoors?",
+    "Is it used for work or productivity?",
+    "Is it used for entertainment?",
+    "Is it electronic?",
+    "Is it made of metal?",
+    "Is it something you can wear?",
+    "Is it a type of food?",
+    "Is it found in a kitchen?"
+  ];
+
+  for (const q of fallback) {
+    const norm = normalizeQuestion(q).toLowerCase();
+    if (!askedSet.has(norm)) {
+      return { question: q, used: "fallback" };
+    }
+  }
+
+  // Last resort
+  return { question: "Is it something you can hold in one hand?", used: "last-resort" };
 }
 
 module.exports = async function (context, req) {
   try {
     const body = req.body || {};
     const sessionId = body.sessionId;
-    const userAnswer = (body.userAnswer || "").toString().trim().toLowerCase();
+    const userAnswerRaw = (body.userAnswer || "").toString().trim();
 
     if (!sessionId) {
       context.res = {
@@ -151,25 +217,35 @@ module.exports = async function (context, req) {
     const current = Number(entity.questionNumber || 0);
     const next = current + 1;
 
-    // Update notes (tiny memory)
-    const prevNotes = (entity.notes || "").toString();
-    const safeAnswer = userAnswer.replace(/\s+/g, " ").slice(0, 120);
-    const updatedNotes =
-      (prevNotes ? prevNotes + " | " : "") + `Q${next}:${safeAnswer}`;
-    const notes = updatedNotes.slice(-800);
+    // Read asked questions list
+    const asked = safeJsonParse(entity.askedJson || "[]", []);
+    const askedClean = Array.isArray(asked) ? asked : [];
 
-    // Call Azure OpenAI for next question
-    const { question, used } = await callAzureOpenAI({
-      notes,
+    // Build a compact notes string (answers + questions)
+    const prevNotes = (entity.notes || "").toString();
+    const safeAnswer = userAnswerRaw.replace(/\s+/g, " ").slice(0, 120);
+
+    // Get a non-repeating question
+    const { question, used } = await getNonRepeatingQuestion({
+      notes: prevNotes,
       questionNumber: next,
-      userAnswer: safeAnswer
+      userAnswer: safeAnswer,
+      asked: askedClean
     });
+
+    // Update asked list + notes
+    askedClean.push(question);
+
+    const newNotesLine = `Q${next}: ${question} | A: ${safeAnswer}`;
+    const combinedNotes = (prevNotes ? prevNotes + "\n" : "") + newNotesLine;
+    const notes = combinedNotes.slice(-2000); // cap size
 
     // Persist state
     entity.questionNumber = next;
     entity.lastAnswer = safeAnswer;
     entity.lastQuestion = question;
     entity.notes = notes;
+    entity.askedJson = JSON.stringify(askedClean.slice(-50)); // cap stored list
     entity.updatedAt = new Date().toISOString();
     await tableClient.updateEntity(entity, "Merge");
 

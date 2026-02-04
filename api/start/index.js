@@ -26,7 +26,9 @@ module.exports = async function (context, req) {
       rowKey: sessionId,
       questionNumber: 0,
       notes: "",
-      createdAt: new Date().toISOString()
+      askedJson: "[]", // IMPORTANT: list of questions already asked
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
     });
 
     context.res = {
