@@ -7,19 +7,11 @@ function env(name) {
 }
 
 function safeJsonParse(s, fallback) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return fallback;
-  }
+  try { return JSON.parse(s); } catch { return fallback; }
 }
 
 function normalizeText(t) {
-  return (t || "")
-    .toString()
-    .trim()
-    .replace(/\s+/g, " ")
-    .replace(/^["'“”]+|["'“”]+$/g, "");
+  return (t || "").toString().trim().replace(/\s+/g, " ").replace(/^["'“”]+|["'“”]+$/g, "");
 }
 
 function clamp(s, n) {
@@ -27,29 +19,91 @@ function clamp(s, n) {
   return t.length > n ? t.slice(0, n) : t;
 }
 
+function isYes(a) { return normalizeText(a).toLowerCase() === "yes"; }
+function isNo(a) { return normalizeText(a).toLowerCase() === "no"; }
+
 async function postJson(url, headers, body) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body)
   });
-
   const text = await res.text();
   let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    // ignore
-  }
-
+  try { json = text ? JSON.parse(text) : null; } catch {}
   return { ok: res.ok, status: res.status, text, json };
 }
 
 /**
- * Ask model to return strict JSON:
- * { "type": "question"|"guess", "text": "...?", "notes": "..." }
+ * Facts schema we maintain:
+ * {
+ *   living: true/false/null,
+ *   plant: true/false/null,
+ *   animal: true/false/null
+ * }
+ *
+ * We start small with just these 3 because they prevent your exact issue.
+ * Later we can expand facts safely.
  */
-async function callAzureOpenAI_JSON({ notes, questionNumber, userAnswer, asked }) {
+function initFacts(existing) {
+  const f = existing && typeof existing === "object" ? existing : {};
+  return {
+    living: typeof f.living === "boolean" ? f.living : null,
+    plant: typeof f.plant === "boolean" ? f.plant : null,
+    animal: typeof f.animal === "boolean" ? f.animal : null
+  };
+}
+
+/**
+ * Update facts based on the last question + user's answer.
+ * This is small “game engine” logic, not hardcoding the whole game,
+ * just preventing contradictions on the most common funnel.
+ */
+function updateFactsFromQA(facts, lastQ, answer) {
+  const q = normalizeText(lastQ).toLowerCase();
+
+  // Only map very specific standard questions
+  if (q.includes("living thing")) facts.living = isYes(answer) ? true : isNo(answer) ? false : facts.living;
+  if (q === "is it a plant?" || q.includes("is it a plant")) facts.plant = isYes(answer) ? true : isNo(answer) ? false : facts.plant;
+  if (q === "is it an animal?" || q.includes("is it an animal")) facts.animal = isYes(answer) ? true : isNo(answer) ? false : facts.animal;
+
+  // Derived logic: plant => living, animal => living
+  if (facts.plant === true) facts.living = true;
+  if (facts.animal === true) facts.living = true;
+
+  // Derived logic: plant true => animal false (and vice versa)
+  if (facts.plant === true) facts.animal = false;
+  if (facts.animal === true) facts.plant = false;
+
+  return facts;
+}
+
+function contradictsFacts(facts, nextQuestion) {
+  const q = normalizeText(nextQuestion).toLowerCase();
+
+  // If we already know it's a plant, asking "animal?" is a contradiction.
+  if (facts.plant === true && (q === "is it an animal?" || q.includes("is it an animal"))) return true;
+  if (facts.animal === true && (q === "is it a plant?" || q.includes("is it a plant"))) return true;
+
+  // If we already know "not living", asking plant/animal is contradiction
+  if (facts.living === false && (q.includes("is it a plant") || q.includes("is it an animal"))) return true;
+
+  // If we already know living=true, asking "Is it a living thing?" is redundant
+  if (facts.living === true && q.includes("is it a living thing")) return true;
+
+  return false;
+}
+
+/**
+ * AI must return strict JSON:
+ * {
+ *   "type": "question"|"guess",
+ *   "text": "...?",
+ *   "notes": "...",
+ *   "facts": { "living": true/false/null, "plant": true/false/null, "animal": true/false/null }
+ * }
+ */
+async function callAzureOpenAI_JSON({ notes, facts, questionNumber, userAnswer, asked }) {
   const endpoint = env("AZURE_OPENAI_ENDPOINT").replace(/\/+$/, "");
   const apiKey = env("AZURE_OPENAI_KEY");
   const deployment = env("AZURE_OPENAI_DEPLOYMENT");
@@ -57,30 +111,30 @@ async function callAzureOpenAI_JSON({ notes, questionNumber, userAnswer, asked }
 
   const askedList = (asked || []).slice(-25);
   const askedText =
-    askedList.length > 0
-      ? askedList.map((q, i) => `${i + 1}. ${q}`).join("\n")
-      : "(none yet)";
+    askedList.length > 0 ? askedList.map((q, i) => `${i + 1}. ${q}`).join("\n") : "(none yet)";
 
   const system = [
     "You are the game engine for 20 Questions.",
     "You must output ONLY valid JSON (no markdown, no extra text).",
     "",
     "Return this exact JSON shape:",
-    '{ "type": "question" | "guess", "text": string, "notes": string }',
+    '{ "type": "question" | "guess", "text": string, "notes": string, "facts": { "living": boolean|null, "plant": boolean|null, "animal": boolean|null } }',
     "",
     "Rules:",
     "- If you are NOT confident yet, type must be 'question' and text must be a single YES/NO question ending with '?'.",
-    "- Only use type='guess' when you are making a SPECIFIC final guess (a noun/thing), like: 'Is it a toaster?'.",
-    "- Do NOT end the game with generic category guesses like 'Is it living?' or 'Is it for entertainment?'. Those are questions, not guesses.",
+    "- Only use type='guess' when you are making a SPECIFIC object guess (e.g. 'Is it a toaster?').",
+    "- Do NOT end the game with generic category guesses like 'Is it living?'.",
     "- Do NOT repeat any question from the Previously asked list.",
-    "- Keep notes short (<= 200 chars): key facts learned so far.",
-    "- Max 20 turns."
+    "- Do NOT contradict known facts. Example: if plant=true, do NOT ask animal.",
+    "- Update facts correctly: plant=true implies animal=false and living=true.",
+    "- Keep notes short (<=200 chars)."
   ].join("\n");
 
   const user = [
     `Turn: ${questionNumber}/20`,
     `User answered: ${userAnswer || "(none yet)"}`,
     `Current notes: ${notes || "(none)"}`,
+    `Known facts JSON: ${JSON.stringify(facts)}`,
     `Previously asked (do not repeat):\n${askedText}`,
     "",
     "Now output the next step as JSON."
@@ -91,102 +145,91 @@ async function callAzureOpenAI_JSON({ notes, questionNumber, userAnswer, asked }
     { role: "user", content: user }
   ];
 
-  const attempts = [];
-
-  // A) classic deployments endpoint
-  attempts.push({
-    name: "classic-deployments",
-    url: `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2024-02-15-preview`,
-    headers: { "api-key": apiKey },
-    body: { messages, temperature: 0.4, max_tokens: 160 }
-  });
-
-  // B) v1 endpoint model=deployment
-  attempts.push({
-    name: "v1-model=deployment",
-    url: `${endpoint}/openai/v1/chat/completions`,
-    headers: { "api-key": apiKey },
-    body: { model: deployment, messages, temperature: 0.4, max_tokens: 160 }
-  });
-
-  // C) v1 endpoint model=modelName
-  attempts.push({
-    name: "v1-model=modelName",
-    url: `${endpoint}/openai/v1/chat/completions`,
-    headers: { "api-key": apiKey },
-    body: { model: modelName, messages, temperature: 0.4, max_tokens: 160 }
-  });
+  const attempts = [
+    {
+      name: "classic-deployments",
+      url: `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2024-02-15-preview`,
+      headers: { "api-key": apiKey },
+      body: { messages, temperature: 0.4, max_tokens: 220 }
+    },
+    {
+      name: "v1-model=deployment",
+      url: `${endpoint}/openai/v1/chat/completions`,
+      headers: { "api-key": apiKey },
+      body: { model: deployment, messages, temperature: 0.4, max_tokens: 220 }
+    },
+    {
+      name: "v1-model=modelName",
+      url: `${endpoint}/openai/v1/chat/completions`,
+      headers: { "api-key": apiKey },
+      body: { model: modelName, messages, temperature: 0.4, max_tokens: 220 }
+    }
+  ];
 
   let lastError = null;
 
   for (const a of attempts) {
     const r = await postJson(a.url, a.headers, a.body);
-
     if (r.ok && r.json) {
       const content =
         r.json?.choices?.[0]?.message?.content?.trim() ||
         r.json?.choices?.[0]?.text?.trim();
 
-      if (!content) {
-        lastError = new Error(`OpenAI ${a.name} returned no content`);
-        continue;
-      }
-
-      // Parse the JSON the model returned
       const parsed = safeJsonParse(content, null);
       if (!parsed || typeof parsed !== "object") {
-        lastError = new Error(`OpenAI ${a.name} did not return valid JSON: ${content}`);
+        lastError = new Error(`Model did not return JSON: ${content}`);
         continue;
       }
 
       const type = (parsed.type || "").toString().toLowerCase();
       let text = normalizeText(parsed.text || "");
       let newNotes = normalizeText(parsed.notes || "");
+      const newFacts = initFacts(parsed.facts);
 
       if (type !== "question" && type !== "guess") {
-        lastError = new Error(`OpenAI ${a.name} invalid type: ${type}`);
+        lastError = new Error(`Invalid type: ${type}`);
         continue;
       }
-
       if (!text) {
-        lastError = new Error(`OpenAI ${a.name} missing text`);
+        lastError = new Error("Missing text");
         continue;
       }
-
       if (!text.endsWith("?")) text += "?";
       newNotes = clamp(newNotes, 200);
 
-      return { type, text, notes: newNotes, used: a.name };
+      return { type, text, notes: newNotes, facts: newFacts, used: a.name };
     }
 
-    lastError = new Error(
-      `OpenAI ${a.name} failed (${r.status}): ${r.text || "(empty response)"}`
-    );
+    lastError = new Error(`OpenAI ${a.name} failed (${r.status}): ${r.text || "(empty)"}`);
   }
 
   throw lastError || new Error("Azure OpenAI call failed");
 }
 
-/**
- * Non-repeat wrapper: if model repeats, retry a few times.
- * Uses asked array to detect repeats.
- */
-async function getNonRepeatingStep({ notes, questionNumber, userAnswer, asked }) {
+async function getValidNextStep({ notes, facts, questionNumber, userAnswer, asked }) {
   const askedSet = new Set((asked || []).map((q) => normalizeText(q).toLowerCase()));
 
-  for (let i = 0; i < 4; i++) {
-    const step = await callAzureOpenAI_JSON({ notes, questionNumber, userAnswer, asked });
+  for (let i = 0; i < 5; i++) {
+    const step = await callAzureOpenAI_JSON({ notes, facts, questionNumber, userAnswer, asked });
     const norm = normalizeText(step.text).toLowerCase();
-    if (!askedSet.has(norm)) return step;
+
+    // No repeats
+    if (askedSet.has(norm)) continue;
+
+    // No contradictions (backend enforcement)
+    if (contradictsFacts(facts, step.text)) continue;
+
+    return step;
   }
 
-  // fallback question only (never a guess)
-  return {
-    type: "question",
-    text: "Is it something you can hold in one hand?",
-    notes: clamp(notes || "", 200),
-    used: "fallback"
-  };
+  // Safe fallback based on facts
+  if (facts.plant === true) {
+    return { type: "question", text: "Is it something you would find in a garden?", notes: clamp(notes || "", 200), facts, used: "fallback" };
+  }
+  if (facts.animal === true) {
+    return { type: "question", text: "Is it a domesticated animal?", notes: clamp(notes || "", 200), facts, used: "fallback" };
+  }
+  return { type: "question", text: "Is it something you can hold in one hand?", notes: clamp(notes || "", 200), facts, used: "fallback" };
 }
 
 module.exports = async function (context, req) {
@@ -197,11 +240,7 @@ module.exports = async function (context, req) {
     const playerNameRaw = (body.playerName || "").toString().trim();
 
     if (!sessionId) {
-      context.res = {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-        body: { text: "Missing sessionId." }
-      };
+      context.res = { status: 400, headers: { "Content-Type": "application/json" }, body: { text: "Missing sessionId." } };
       return;
     }
 
@@ -214,14 +253,21 @@ module.exports = async function (context, req) {
 
     const entity = await sessionsClient.getEntity("session", sessionId);
 
-    // Win check is now AI-driven:
-    // only if previous bot step was type='guess'
+    // Load/maintain facts
+    let facts = initFacts(safeJsonParse(entity.factsJson || "{}", {}));
+
+    // Update facts from the LAST question and the user's current answer
+    const prevQ = entity.lastQuestion || "";
+    if (prevQ && safeAnswer) {
+      facts = updateFactsFromQA(facts, prevQ, safeAnswer);
+    }
+
+    // Win condition (AI-driven): only if lastType was 'guess' and user says yes
     const lastType = (entity.lastType || "").toString().toLowerCase();
-    const lastQ = entity.lastQuestion || "";
-    const won = lastType === "guess" && safeAnswer.toLowerCase() === "yes";
+    const won = lastType === "guess" && isYes(safeAnswer);
 
     if (won) {
-      const guess = lastQ;
+      const guess = prevQ; // lastQuestion stores the guess text
       const questionsTaken = Number(entity.questionNumber || 0);
 
       const rowKey = `${Date.now()}-${sessionId}`;
@@ -236,17 +282,13 @@ module.exports = async function (context, req) {
 
       entity.completed = true;
       entity.completedAt = new Date().toISOString();
+      entity.factsJson = JSON.stringify(facts);
       await sessionsClient.updateEntity(entity, "Merge");
 
       context.res = {
         status: 200,
         headers: { "Content-Type": "application/json" },
-        body: {
-          text: `🎉 Nice! I got it in ${questionsTaken} questions. Score saved for ${playerName}.`,
-          won: true,
-          questionsTaken,
-          guess
-        }
+        body: { text: `🎉 Nice! I got it in ${questionsTaken} questions. Score saved for ${playerName}.`, won: true, questionsTaken, guess }
       };
       return;
     }
@@ -260,24 +302,22 @@ module.exports = async function (context, req) {
 
     const prevNotes = (entity.notes || "").toString();
 
-    const step = await getNonRepeatingStep({
+    const step = await getValidNextStep({
       notes: prevNotes,
+      facts,
       questionNumber: next,
       userAnswer: safeAnswer,
       asked: askedClean
     });
 
-    // Track asked questions regardless of type
     askedClean.push(step.text);
-
-    // Notes: prefer model notes if provided, else keep existing
-    const notesToSave = step.notes ? step.notes : clamp(prevNotes, 200);
 
     entity.questionNumber = next;
     entity.lastAnswer = safeAnswer;
-    entity.lastQuestion = step.text;     // store question/guess text
-    entity.lastType = step.type;         // store whether it was question or guess
-    entity.notes = notesToSave;
+    entity.lastQuestion = step.text;
+    entity.lastType = step.type;
+    entity.notes = step.notes || clamp(prevNotes, 200);
+    entity.factsJson = JSON.stringify(step.facts || facts);
     entity.askedJson = JSON.stringify(askedClean.slice(-60));
     entity.updatedAt = new Date().toISOString();
     await sessionsClient.updateEntity(entity, "Merge");
@@ -288,17 +328,14 @@ module.exports = async function (context, req) {
       body: {
         text: `Question ${next}/20: ${step.text}`,
         questionNumber: next,
-        debug: { openaiRoute: step.used, type: step.type }
+        debug: { openaiRoute: step.used, type: step.type, facts: step.facts || facts }
       }
     };
   } catch (err) {
     context.res = {
       status: 500,
       headers: { "Content-Type": "application/json" },
-      body: {
-        text: "Backend error in /api/message",
-        details: err && err.message ? err.message : String(err)
-      }
+      body: { text: "Backend error in /api/message", details: err && err.message ? err.message : String(err) }
     };
   }
 };
