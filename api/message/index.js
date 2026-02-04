@@ -23,6 +23,19 @@ function normalizeQuestion(q) {
     .replace(/^["'“”]+|["'“”]+$/g, "");
 }
 
+function isGuessQuestion(q) {
+  const t = normalizeQuestion(q).toLowerCase();
+  // Basic “guess” heuristic
+  return t.startsWith("is it ") && t.endsWith("?");
+}
+
+function extractGuessText(q) {
+  const t = normalizeQuestion(q);
+  // "Is it a toaster?" -> "a toaster"
+  const m = t.match(/^Is it\s+(.*)\?$/i);
+  return m ? m[1].trim() : "";
+}
+
 async function postJson(url, headers, body) {
   const res = await fetch(url, {
     method: "POST",
@@ -41,10 +54,6 @@ async function postJson(url, headers, body) {
   return { ok: res.ok, status: res.status, text, json };
 }
 
-/**
- * Robust Azure OpenAI call: tries multiple endpoint styles.
- * Returns: { question, used }
- */
 async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
   const endpoint = env("AZURE_OPENAI_ENDPOINT").replace(/\/+$/, "");
   const apiKey = env("AZURE_OPENAI_KEY");
@@ -53,7 +62,7 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
   // Your deployed model name (from Foundry details)
   const modelName = "gpt-4.1-nano";
 
-  const askedList = (asked || []).slice(-20); // cap so prompt stays small
+  const askedList = (asked || []).slice(-20);
   const askedText =
     askedList.length > 0
       ? askedList.map((q, i) => `${i + 1}. ${q}`).join("\n")
@@ -86,7 +95,6 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
 
   const attempts = [];
 
-  // Attempt A: classic Azure OpenAI deployments endpoint
   attempts.push({
     name: "classic-deployments",
     url: `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2024-02-15-preview`,
@@ -94,7 +102,6 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
     body: { messages, temperature: 0.4, max_tokens: 80 }
   });
 
-  // Attempt B: v1 endpoint using model=deployment
   attempts.push({
     name: "v1-model=deployment",
     url: `${endpoint}/openai/v1/chat/completions`,
@@ -102,7 +109,6 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
     body: { model: deployment, messages, temperature: 0.4, max_tokens: 80 }
   });
 
-  // Attempt C: v1 endpoint using model=modelName
   attempts.push({
     name: "v1-model=modelName",
     url: `${endpoint}/openai/v1/chat/completions`,
@@ -110,7 +116,6 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
     body: { model: modelName, messages, temperature: 0.4, max_tokens: 80 }
   });
 
-  // Attempt D: Bearer auth variant
   attempts.push({
     name: "v1-bearer-model=deployment",
     url: `${endpoint}/openai/v1/chat/completions`,
@@ -146,14 +151,9 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
   throw lastError || new Error("Azure OpenAI call failed");
 }
 
-/**
- * Ensure we never repeat a question.
- * If model repeats, retry a few times. If still repeats, fallback.
- */
 async function getNonRepeatingQuestion({ notes, questionNumber, userAnswer, asked }) {
   const askedSet = new Set((asked || []).map((q) => normalizeQuestion(q).toLowerCase()));
 
-  // Try model up to 3 times
   for (let i = 0; i < 3; i++) {
     const { question, used } = await callAzureOpenAI({
       notes,
@@ -168,7 +168,6 @@ async function getNonRepeatingQuestion({ notes, questionNumber, userAnswer, aske
     }
   }
 
-  // Hard fallback bank (guaranteed non-repeat)
   const fallback = [
     "Is it an animal?",
     "Is it a plant?",
@@ -189,7 +188,6 @@ async function getNonRepeatingQuestion({ notes, questionNumber, userAnswer, aske
     }
   }
 
-  // Last resort
   return { question: "Is it something you can hold in one hand?", used: "last-resort" };
 }
 
@@ -209,21 +207,57 @@ module.exports = async function (context, req) {
     }
 
     const storageConn = env("STORAGE_CONNECTION_STRING");
-    const tableClient = TableClient.fromConnectionString(storageConn, "Sessions");
+    const sessionsClient = TableClient.fromConnectionString(storageConn, "Sessions");
+    const scoresClient = TableClient.fromConnectionString(storageConn, "Scores");
 
     // Read session
-    const entity = await tableClient.getEntity("session", sessionId);
+    const entity = await sessionsClient.getEntity("session", sessionId);
 
     const current = Number(entity.questionNumber || 0);
     const next = current + 1;
 
-    // Read asked questions list
     const asked = safeJsonParse(entity.askedJson || "[]", []);
     const askedClean = Array.isArray(asked) ? asked : [];
 
-    // Build a compact notes string (answers + questions)
     const prevNotes = (entity.notes || "").toString();
     const safeAnswer = userAnswerRaw.replace(/\s+/g, " ").slice(0, 120);
+
+    // ✅ WIN DETECTION: if last question was a guess and user says "yes"
+    const lastQ = entity.lastQuestion || "";
+    const won = isGuessQuestion(lastQ) && safeAnswer.toLowerCase() === "yes";
+
+    if (won) {
+      const guess = extractGuessText(lastQ) || "(unknown)";
+      const questionsTaken = Number(entity.questionNumber || 0);
+
+      // Write score row
+      const rowKey = `${Date.now()}-${sessionId}`;
+      await scoresClient.createEntity({
+        partitionKey: "score",
+        rowKey,
+        name: "Seb", // change later when we add name input
+        questions: questionsTaken,
+        guess,
+        createdAt: new Date().toISOString()
+      });
+
+      // Reset the session (optional): mark as complete
+      entity.completed = true;
+      entity.completedAt = new Date().toISOString();
+      await sessionsClient.updateEntity(entity, "Merge");
+
+      context.res = {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+        body: {
+          text: `🎉 Nice! I got it in ${questionsTaken} questions. Score saved.`,
+          won: true,
+          questionsTaken,
+          guess
+        }
+      };
+      return;
+    }
 
     // Get a non-repeating question
     const { question, used } = await getNonRepeatingQuestion({
@@ -233,21 +267,20 @@ module.exports = async function (context, req) {
       asked: askedClean
     });
 
-    // Update asked list + notes
     askedClean.push(question);
 
     const newNotesLine = `Q${next}: ${question} | A: ${safeAnswer}`;
     const combinedNotes = (prevNotes ? prevNotes + "\n" : "") + newNotesLine;
-    const notes = combinedNotes.slice(-2000); // cap size
+    const notes = combinedNotes.slice(-2000);
 
     // Persist state
     entity.questionNumber = next;
     entity.lastAnswer = safeAnswer;
     entity.lastQuestion = question;
     entity.notes = notes;
-    entity.askedJson = JSON.stringify(askedClean.slice(-50)); // cap stored list
+    entity.askedJson = JSON.stringify(askedClean.slice(-50));
     entity.updatedAt = new Date().toISOString();
-    await tableClient.updateEntity(entity, "Merge");
+    await sessionsClient.updateEntity(entity, "Merge");
 
     context.res = {
       status: 200,
