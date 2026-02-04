@@ -25,6 +25,24 @@
       .grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 16px; }
       @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 
+      .topbar {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin: 10px 0 14px;
+      }
+      .topbar label { font-size: 13px; opacity: .85; }
+      .namebox {
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid #223052;
+        background: #0f1524;
+        color: #e8eefc;
+        outline: none;
+        width: 220px;
+        max-width: 60vw;
+      }
+
       .chat {
         height: 420px;
         overflow: auto;
@@ -47,7 +65,7 @@
       .you .bubble { background: #2a4fff; color: #fff; }
 
       .row { display: flex; gap: 10px; margin-top: 12px; }
-      input {
+      input.answer {
         flex: 1;
         padding: 12px 12px;
         border-radius: 12px;
@@ -106,12 +124,17 @@
         <h1>TwentyQ</h1>
         <p class="sub">Type your answers: <code>yes</code>, <code>no</code>, <code>sometimes</code>, <code>not sure</code>.</p>
 
+        <div class="topbar">
+          <label for="playerName">Your name:</label>
+          <input id="playerName" class="namebox" placeholder="e.g. Beth" maxlength="24" />
+        </div>
+
         <div class="grid">
           <div>
             <div id="chat" class="chat" aria-live="polite"></div>
 
             <div class="row">
-              <input id="input" placeholder="Type your answer..." autocomplete="off" />
+              <input id="input" class="answer" placeholder="Type your answer..." autocomplete="off" />
               <button id="send">Send</button>
               <button id="restart" class="secondary">Restart</button>
             </div>
@@ -140,9 +163,23 @@
       const restartBtn = document.getElementById("restart");
       const statusEl = document.getElementById("status");
       const lbEl = document.getElementById("lb");
+      const nameEl = document.getElementById("playerName");
 
       let sessionId = null;
       let busy = false;
+
+      // Persist name locally (per browser)
+      const savedName = localStorage.getItem("twentyq_name");
+      if (savedName) nameEl.value = savedName;
+
+      nameEl.addEventListener("input", () => {
+        localStorage.setItem("twentyq_name", nameEl.value.trim());
+      });
+
+      function getPlayerName() {
+        const n = (nameEl.value || "").trim();
+        return n ? n.slice(0, 24) : "Anonymous";
+      }
 
       function addMsg(text, who) {
         const row = document.createElement("div");
@@ -247,7 +284,12 @@
         addMsg(answer, "you");
 
         setBusy(true);
-        const r = await apiPost("/api/message", { sessionId, userAnswer: answer });
+
+        const r = await apiPost("/api/message", {
+          sessionId,
+          userAnswer: answer,
+          playerName: getPlayerName()
+        });
 
         if (!r.ok) {
           addMsg("Backend error: " + (r.json?.details || r.json?.text || "Request failed"), "bot");
@@ -255,7 +297,6 @@
           return;
         }
 
-        // Win case
         if (r.json && r.json.won) {
           addMsg(r.json.text || "🎉 Score saved!", "bot");
           await loadLeaderboard();

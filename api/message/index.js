@@ -23,15 +23,56 @@ function normalizeQuestion(q) {
     .replace(/^["'“”]+|["'“”]+$/g, "");
 }
 
-function isGuessQuestion(q) {
+/**
+ * NEW: Only treat it as a "win guess" if it looks like a SPECIFIC guess.
+ * Not allowed: "Is it living?", "Is it alive?", "Is it a living thing?"
+ * Allowed: "Is it a cat?", "Is it a toaster?", "Is it a guitar?"
+ */
+function isSpecificGuessQuestion(q) {
   const t = normalizeQuestion(q).toLowerCase();
-  // Basic “guess” heuristic
-  return t.startsWith("is it ") && t.endsWith("?");
+
+  if (!t.startsWith("is it ")) return false;
+  if (!t.endsWith("?")) return false;
+
+  // extract guess text
+  const guess = t.replace(/^is it\s+/, "").replace(/\?$/, "").trim();
+
+  // too short = not a guess
+  if (guess.length < 4) return false;
+
+  // block generic category guesses that end games too early
+  const banned = new Set([
+    "living",
+    "alive",
+    "a living thing",
+    "living thing",
+    "an animal",
+    "a plant",
+    "a person",
+    "a human",
+    "something living",
+    "something alive"
+  ]);
+
+  if (banned.has(guess)) return false;
+
+  // If it contains ONLY category words, also block
+  const genericPatterns = [
+    /^a(n)?\s+living(\s+thing)?$/,
+    /^alive$/,
+    /^living$/,
+    /^a(n)?\s+animal$/,
+    /^a(n)?\s+plant$/,
+    /^a(n)?\s+person$/,
+    /^a(n)?\s+human$/
+  ];
+  if (genericPatterns.some((re) => re.test(guess))) return false;
+
+  return true;
 }
 
 function extractGuessText(q) {
   const t = normalizeQuestion(q);
-  // "Is it a toaster?" -> "a toaster"
   const m = t.match(/^Is it\s+(.*)\?$/i);
   return m ? m[1].trim() : "";
 }
@@ -58,11 +99,9 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
   const endpoint = env("AZURE_OPENAI_ENDPOINT").replace(/\/+$/, "");
   const apiKey = env("AZURE_OPENAI_KEY");
   const deployment = env("AZURE_OPENAI_DEPLOYMENT");
-
-  // Your deployed model name (from Foundry details)
   const modelName = "gpt-4.1-nano";
 
-  const askedList = (asked || []).slice(-20);
+  const askedList = (asked || []).slice(-25);
   const askedText =
     askedList.length > 0
       ? askedList.map((q, i) => `${i + 1}. ${q}`).join("\n")
@@ -76,7 +115,8 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
     "- It must be a YES/NO style question.",
     "- Do NOT repeat any question from the Previously asked list.",
     "- Keep it short and specific.",
-    "- If very confident, ask: 'Is it <your guess>?'",
+    "- IMPORTANT: Don't end the game with generic category guesses like 'Is it living?' or 'Is it an animal?'.",
+    "- Only make a final guess when it is a specific object (e.g. 'Is it a toaster?').",
     "- Max 20 questions total."
   ].join("\n");
 
@@ -99,28 +139,28 @@ async function callAzureOpenAI({ notes, questionNumber, userAnswer, asked }) {
     name: "classic-deployments",
     url: `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2024-02-15-preview`,
     headers: { "api-key": apiKey },
-    body: { messages, temperature: 0.4, max_tokens: 80 }
+    body: { messages, temperature: 0.5, max_tokens: 80 }
   });
 
   attempts.push({
     name: "v1-model=deployment",
     url: `${endpoint}/openai/v1/chat/completions`,
     headers: { "api-key": apiKey },
-    body: { model: deployment, messages, temperature: 0.4, max_tokens: 80 }
+    body: { model: deployment, messages, temperature: 0.5, max_tokens: 80 }
   });
 
   attempts.push({
     name: "v1-model=modelName",
     url: `${endpoint}/openai/v1/chat/completions`,
     headers: { "api-key": apiKey },
-    body: { model: modelName, messages, temperature: 0.4, max_tokens: 80 }
+    body: { model: modelName, messages, temperature: 0.5, max_tokens: 80 }
   });
 
   attempts.push({
     name: "v1-bearer-model=deployment",
     url: `${endpoint}/openai/v1/chat/completions`,
     headers: { Authorization: `Bearer ${apiKey}` },
-    body: { model: deployment, messages, temperature: 0.4, max_tokens: 80 }
+    body: { model: deployment, messages, temperature: 0.5, max_tokens: 80 }
   });
 
   let lastError = null;
@@ -196,6 +236,7 @@ module.exports = async function (context, req) {
     const body = req.body || {};
     const sessionId = body.sessionId;
     const userAnswerRaw = (body.userAnswer || "").toString().trim();
+    const playerNameRaw = (body.playerName || "").toString().trim();
 
     if (!sessionId) {
       context.res = {
@@ -206,11 +247,12 @@ module.exports = async function (context, req) {
       return;
     }
 
+    const playerName = playerNameRaw ? playerNameRaw.slice(0, 24) : "Anonymous";
+
     const storageConn = env("STORAGE_CONNECTION_STRING");
     const sessionsClient = TableClient.fromConnectionString(storageConn, "Sessions");
     const scoresClient = TableClient.fromConnectionString(storageConn, "Scores");
 
-    // Read session
     const entity = await sessionsClient.getEntity("session", sessionId);
 
     const current = Number(entity.questionNumber || 0);
@@ -222,26 +264,25 @@ module.exports = async function (context, req) {
     const prevNotes = (entity.notes || "").toString();
     const safeAnswer = userAnswerRaw.replace(/\s+/g, " ").slice(0, 120);
 
-    // ✅ WIN DETECTION: if last question was a guess and user says "yes"
+    // ✅ FIXED WIN DETECTION: only wins if last question is a SPECIFIC guess
     const lastQ = entity.lastQuestion || "";
-    const won = isGuessQuestion(lastQ) && safeAnswer.toLowerCase() === "yes";
+    const won =
+      isSpecificGuessQuestion(lastQ) && safeAnswer.toLowerCase() === "yes";
 
     if (won) {
       const guess = extractGuessText(lastQ) || "(unknown)";
       const questionsTaken = Number(entity.questionNumber || 0);
 
-      // Write score row
       const rowKey = `${Date.now()}-${sessionId}`;
       await scoresClient.createEntity({
         partitionKey: "score",
         rowKey,
-        name: "Seb", // change later when we add name input
+        name: playerName,
         questions: questionsTaken,
         guess,
         createdAt: new Date().toISOString()
       });
 
-      // Reset the session (optional): mark as complete
       entity.completed = true;
       entity.completedAt = new Date().toISOString();
       await sessionsClient.updateEntity(entity, "Merge");
@@ -250,7 +291,7 @@ module.exports = async function (context, req) {
         status: 200,
         headers: { "Content-Type": "application/json" },
         body: {
-          text: `🎉 Nice! I got it in ${questionsTaken} questions. Score saved.`,
+          text: `🎉 Nice! I got it in ${questionsTaken} questions. Score saved for ${playerName}.`,
           won: true,
           questionsTaken,
           guess
@@ -259,7 +300,6 @@ module.exports = async function (context, req) {
       return;
     }
 
-    // Get a non-repeating question
     const { question, used } = await getNonRepeatingQuestion({
       notes: prevNotes,
       questionNumber: next,
@@ -273,7 +313,6 @@ module.exports = async function (context, req) {
     const combinedNotes = (prevNotes ? prevNotes + "\n" : "") + newNotesLine;
     const notes = combinedNotes.slice(-2000);
 
-    // Persist state
     entity.questionNumber = next;
     entity.lastAnswer = safeAnswer;
     entity.lastQuestion = question;
